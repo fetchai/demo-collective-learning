@@ -1,0 +1,41 @@
+# Build Output
+/*build*/
+*.pyc
+*.egg-info/
+*.key
+info.txt
+*.db
+CMakeCache.txt
+
+/docs/build
+
+# Merge Outputs
+*.orig
+
+.ipynb_checkpoints/
+
+# Bazel Files
+bazel-*
+
+# Legacy Editors
+\#*#
+.\#*
+*~
+*.swp
+*.swo
+*.swn
+.idea/
+*.osm
+tags
+
+*.gz
+*.so
+
+*.DS_Store
+*.ipynb_checkpoints/
+
+# Legacy Editors
+build-profile-summary.csv
+
+# LR
+*.ignoreme.*
