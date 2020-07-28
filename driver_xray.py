@@ -1,4 +1,3 @@
-import sys
 from pathlib import Path
 from random import randint
 import random as rand
@@ -7,30 +6,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nn_func
 import torch.optim as optim
-from sklearn.metrics import roc_curve
-from torch.utils.data import Dataset, WeightedRandomSampler
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import Dataset
 import numpy as np
 import syft as sy
 from torchsummary import summary
 
 hook = sy.TorchHook(torch)
 
-LOSSES = {}  # dictionary of loss for each worker
-
 
 class Arguments:
     def __init__(self):
         self.batch_size = 8
-        self.n_batches_for_vote = 12
-        self.test_batch_size = 64
+        self.n_batches_for_vote = 13
+        self.test_batch_size = 16
         self.epochs = 15
         self.steps_per_epoch = 10
         self.lr = 0.01
         # self.momentum = 0.5  # momentum is not supported by pysyft
-        self.no_cuda = False
         self.seed = 1
         self.log_interval = 1
-        self.save_model = False
         self.n_hospitals = 5
         self.vote_threshold = (self.n_hospitals - 1) // 2
         self.train_ratio = 0.92
@@ -70,7 +65,6 @@ _________________________________________________________________"""
         self.conv2 = nn.Conv2d(32, 64, (3, 3), padding=1)
         self.bn2 = nn.BatchNorm2d(64)
         self.fc1 = nn.Linear(64, 1)
-        self.threshold = 0.5
 
     def forward(self, x):
         x = nn_func.relu(self.conv1(x))
@@ -84,13 +78,11 @@ _________________________________________________________________"""
         return x  # NB: output is in *logits*
 
 
-def colearn_train(args, model: Net, device,
+def colearn_train(args, model: Net,
                   federated_train_loader: sy.FederatedDataLoader,
                   optimizer, epoch, workers):
-    global LOSSES
     model.train()  # sets model to "training" mode. Does not perform training.
-    # need to save the state dict of the old model
-    state_dict = model.state_dict()
+
     # pick a random hospital
     proposer_index = randint(0, len(workers) - 1)
     proposer = workers[proposer_index]
@@ -101,7 +93,6 @@ def colearn_train(args, model: Net, device,
     # go through all the batches for hosp_n, perform training, get model back
     for batch_idx, data_dict in enumerate(federated_train_loader):  # a distributed dataset
         data, target = data_dict[proposer]
-        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)
 
@@ -112,93 +103,77 @@ def colearn_train(args, model: Net, device,
             loss = loss.get()  # get the loss back
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * args.batch_size,
-                       len(federated_train_loader) * args.batch_size,
-                       100. * batch_idx * len(workers) / len(federated_train_loader), loss.item()))
+                len(federated_train_loader) * args.batch_size,
+                100. * batch_idx * len(workers) / len(federated_train_loader), loss.item()))
         if batch_idx == args.steps_per_epoch:
             break
 
-    # send to others and vote
     model.get()
-    losses = test_on_training_set(args, model, device, federated_train_loader, workers)
-    vote = False
-    print("Doing voting")
-    if not LOSSES:
-        vote = True
-        print("First round, no voting")
-        LOSSES = losses
-    else:
-        votes = 0
-        for worker, old_loss in LOSSES.items():
-            if worker != proposer:
-                if old_loss >= losses[worker]:
-                    votes += 1
-                    print(worker, "votes yes")
-                else:
-                    print(worker, "votes no")
-        if votes >= args.vote_threshold:
-            print("Vote succeeded")
-            vote = True
-            LOSSES = losses
-    if not vote:
-        print("Vote failed")
-        # then load the old weights into the model
-        model.load_state_dict(state_dict)
+    return proposer
 
 
-def test_on_training_set(args: Arguments, model, device, train_loader, workers):
+def test_on_training_set(args: Arguments, model, train_loader, workers):
     model.eval()  # sets model to "eval" mode.
-    losses = {w: 0 for w in workers}
+    aucs = {}
     batch_count = 0
-    criterion = nn.BCEWithLogitsLoss(pos_weight=args.pos_weight, reduction='sum')
-    best_thresholds = []
+    all_targets = {w: np.array([]) for w in workers}
+    all_pred_probs = {w: np.array([]) for w in workers}
     with torch.no_grad():
         for data_dict in train_loader:
             for worker, (data, target) in data_dict.items():
                 model.send(data.location)
-                data, target = data.to(device), target.to(device)
                 output = model(data)
                 pred_prob = torch.sigmoid(output)
-                losses[worker] += criterion(output, target).get()  # sum up batch loss
-                best_thresholds.append(get_best_threshold(target.get().numpy(),
-                                                          pred_prob.get().numpy()))
+                all_targets[worker] = np.append(all_targets[worker], target.get().numpy())
+                all_pred_probs[worker] = np.append(all_pred_probs[worker], pred_prob.get().numpy())
+
                 model.get()
             batch_count += 1
             if batch_count == args.n_batches_for_vote:
                 break
-    print(best_thresholds)
-    best_thresholds.sort()
-    model.threshold = best_thresholds[int(len(best_thresholds) / 2)]
-    return losses
+    for w in workers:
+        aucs[w] = roc_auc_score(all_targets[w], all_pred_probs[w])
+
+    return aucs
 
 
-def test(args, model, device, test_loader):
+def vote(model, args, old_performance, federated_train_loader, workers, proposer):
+    new_performance = test_on_training_set(args, model, federated_train_loader, workers)
+    print("Doing voting")
+
+    votes = 0
+    for worker, old_performance in old_performance.items():
+        if worker != proposer:
+            if new_performance[worker] >= old_performance:
+                votes += 1
+                print(worker, "votes yes")
+            else:
+                print(worker, "votes no")
+    if votes >= args.vote_threshold:
+        print("Vote succeeded")
+        return True, new_performance
+    else:
+        return False, new_performance
+
+
+def test(args, model, test_loader):
     model.eval()  # sets model to "eval" mode.
     test_loss = 0
-    correct = 0
     criterion = nn.BCEWithLogitsLoss(pos_weight=args.pos_weight, reduction='sum')
+    all_targets = np.array([])
+    all_pred_probs = np.array([])
     with torch.no_grad():
         for i, (data, target) in enumerate(test_loader):
-            data, target = data.to(device), target.to(device)
             output = model(data)
             test_loss += criterion(output, target).item()  # sum up batch loss
-
-            pred = torch.sigmoid(output) > model.threshold
-            correct += int((pred == target).int().sum())
+            pred_prob = torch.sigmoid(output)
+            all_targets = np.append(all_targets, target.numpy())
+            all_pred_probs = np.append(all_pred_probs, pred_prob.numpy())
 
     test_loss /= len(test_loader.dataset)
-    print(model.threshold)
-    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-        test_loss, correct, len(test_loader.dataset),
-        100. * correct / len(test_loader.dataset)))
-
-
-def get_best_threshold(y_true, y_pred):
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred)
-    # get the best threshold
-    j = tpr - fpr
-    ix = np.argmax(j)
-    best_thresh = thresholds[ix]
-    return best_thresh
+    auc = roc_auc_score(all_targets, all_pred_probs)
+    print('\nTest set: Average loss: {:.4f}, AUC: {}\n'.format(
+        test_loss, auc))
 
 
 class XrayDataset(Dataset):
@@ -279,61 +254,48 @@ class XrayDataset(Dataset):
 
 def main():
     args = Arguments()
+    torch.manual_seed(args.seed)
 
     hospitals = []
     for i in range(args.n_hospitals):
         hospitals.append(sy.VirtualWorker(hook, id="hospital " + str(i)))
 
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
-    torch.manual_seed(args.seed)
-    device = torch.device("cuda" if use_cuda else "cpu")
-
-    kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
-
-    model = Net().to(device)
+    model = Net()
     summary(model, input_size=(1, 128, 128))
 
-    # need to make a federated dataset for training and an unfederated one for testing
+    # make an unfederated data loader for testing
     test_dataset = XrayDataset(args.data_dir, train=False, train_ratio=args.train_ratio)
-
-    labels = test_dataset.diagnosis  # corresponding labels of samples
-    class_counts = [len(test_dataset.normal_data), len(test_dataset.pneumonia_data)]
-    num_samples = len(test_dataset)
-
-    class_weights = [num_samples / i for i in class_counts]
-    weights = [class_weights[labels[i]] for i in range(num_samples)]
-    sampler = WeightedRandomSampler(torch.tensor(weights), int(num_samples))
 
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=args.test_batch_size, sampler=sampler, **kwargs)
+        batch_size=args.test_batch_size, shuffle=True)
 
-    # initial accuracy
-    test(args, model, device, test_loader)
-    # sys.exit()
+    # show initial accuracy
+    test(args, model, test_loader)
 
-    # make a federated dataset for training
+    # make a federated data loader for training
     train_dataset = XrayDataset(args.data_dir, train_ratio=args.train_ratio)
 
-    # labels = train_dataset.diagnosis  # corresponding labels of samples
-    # class_counts = [len(train_dataset.normal_data), len(train_dataset.pneumonia_data)]
-    # num_samples = len(train_dataset)
-    #
-    # class_weights = [num_samples / i for i in class_counts]
-    # weights = [class_weights[labels[i]] for i in range(num_samples)]
-    # sampler = WeightedRandomSampler(torch.tensor(weights), int(num_samples))
-
-    fed_dataset = train_dataset.federate(hospitals)
-    # sampler is not supported
-    fdataloader = sy.FederatedDataLoader(fed_dataset, batch_size=args.batch_size,
-                                         iter_per_worker=True, shuffle=True, **kwargs)
+    fed_train_dataset = train_dataset.federate(hospitals)
+    fed_train_loader = sy.FederatedDataLoader(fed_train_dataset, batch_size=args.batch_size,
+                                              iter_per_worker=True, shuffle=True)
     optimizer = optim.SGD(model.parameters(), lr=args.lr)
 
+    # current_performance = test_on_training_set(args, model, fdataloader, hospitals)
+    current_performance = {w: 0 for w in hospitals}
     for epoch in range(1, args.epochs + 1):
-        colearn_train(args, model, device, fdataloader, optimizer, epoch, hospitals)
-        test(args, model, device, test_loader)
-    if args.save_model:
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+        current_weights = model.state_dict()
+        proposer = colearn_train(args, model, fed_train_loader, optimizer, epoch, hospitals)
+        update_accepted, new_performance = vote(model, args, current_performance, fed_train_loader, hospitals, proposer)
+        if update_accepted:
+            print("Vote succeeded")
+            current_performance = new_performance
+            print("Testing new model")
+            test(args, model, test_loader)
+        else:
+            print("Vote failed")
+            # load the old weights into the model
+            model.load_state_dict(current_weights)
 
 
 if __name__ == "__main__":
