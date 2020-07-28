@@ -153,6 +153,7 @@ def vote(model, args, old_performance, federated_train_loader, workers, proposer
         print("Vote succeeded")
         return True, new_performance
     else:
+        print("Vote failed")
         return False, new_performance
 
 
@@ -288,12 +289,9 @@ def main():
         proposer = colearn_train(args, model, fed_train_loader, optimizer, epoch, hospitals)
         update_accepted, new_performance = vote(model, args, current_performance, fed_train_loader, hospitals, proposer)
         if update_accepted:
-            print("Vote succeeded")
             current_performance = new_performance
-            print("Testing new model")
             test(args, model, test_loader)
         else:
-            print("Vote failed")
             # load the old weights into the model
             model.load_state_dict(current_weights)
 
