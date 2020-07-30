@@ -39,3 +39,5 @@ build-profile-summary.csv
 
 # LR
 *.ignoreme.*
+
+chest_xray
